@@ -31,8 +31,6 @@
 
 #include <iostream>
 
-#include <boost/foreach.hpp>
-#include <boost/scoped_ptr.hpp>
 #include <OpenEXR/half.h>
 
 #include "imageviewer.h"
@@ -195,7 +193,7 @@ IvImage::longinfo () const
         if (m_spec.z_channel >= 0)
             m_longinfo += html_table_row ("Depth (z) channel", m_spec.z_channel);
 
-        BOOST_FOREACH (const ImageIOParameter &p, m_spec.extra_attribs) {
+        for (auto&& p : m_spec.extra_attribs) {
             std::string s = m_spec.metadata_val (p, true);
             m_longinfo += html_table_row (p.name().c_str(), s);
         }

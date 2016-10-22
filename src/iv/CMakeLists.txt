@@ -20,11 +20,11 @@ if (QT4_FOUND AND OPENGL_FOUND AND GLEW_FOUND)
     endif()
     add_executable (iv ${iv_srcs})
     set_target_properties (iv PROPERTIES FOLDER "Tools")
-    link_ilmbase (iv)
     target_link_libraries (iv OpenImageIO ${QT_LIBRARIES} ${OPENGL_LIBRARIES} 
                                ${Boost_LIBRARIES} ${CMAKE_DL_LIBS}
                                ${GLEW_LIBRARIES})
     oiio_install_targets (iv)
+    set (IV_BUILT 1)
 
 else ()
     message (STATUS "\n\n   WARNING: Qt, OpenGL, or GLEW not found -- 'iv' will not be built!\n")

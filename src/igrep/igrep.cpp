@@ -35,12 +35,9 @@
 #include <ctime>
 #include <iostream>
 #include <iterator>
+#include <memory>
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/foreach.hpp>
 #include <boost/regex.hpp>
-#include <boost/filesystem.hpp>
-using namespace boost::filesystem;
 
 #include "OpenImageIO/argparse.h"
 #include "OpenImageIO/strutil.h"
@@ -80,16 +77,14 @@ grep_file (const std::string &filename, boost::regex &re,
             std::cout.flush();
         }
         bool r = false;
-        boost::filesystem::path path (filename);
-        boost::filesystem::directory_iterator end_itr;  // default is past-end
-        for (boost::filesystem::directory_iterator itr(path);  itr != end_itr;  ++itr) {
-            // std::cout << "  rec " << itr->path() << "\n";
-            r |= grep_file (itr->path().string(), re, true);
-        }
+        std::vector<std::string> directory_entries;
+        Filesystem::get_directory_entries (filename, directory_entries);
+        for (size_t i = 0, e = directory_entries.size(); i < e; ++i)
+            r |= grep_file (directory_entries[i], re, true);
         return r;
     }
 
-    boost::scoped_ptr<ImageInput> in (ImageInput::open (filename.c_str()));
+    std::unique_ptr<ImageInput> in (ImageInput::open (filename.c_str()));
     if (! in.get()) {
         if (! ignore_nonimage_files)
             std::cerr << geterror() << "\n";
@@ -110,7 +105,7 @@ grep_file (const std::string &filename, boost::regex &re,
     do {
         if (!all_subimages && subimage > 0)
             break;
-        BOOST_FOREACH (const ImageIOParameter &p, spec.extra_attribs) {
+        for (auto&& p : spec.extra_attribs) {
             TypeDesc t = p.type();
             if (t.elementtype() == TypeDesc::STRING) {
                 int n = t.numelements();
@@ -189,7 +184,7 @@ main (int argc, const char *argv[])
     if (ignore_case)
         flag |= boost::regex_constants::icase;
     boost::regex re (pattern, flag);
-    BOOST_FOREACH (const std::string &s, filenames) {
+    for (auto&& s : filenames) {
         grep_file (s, re);
     }
 

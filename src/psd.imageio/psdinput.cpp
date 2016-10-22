@@ -32,10 +32,7 @@
 #include <fstream>
 #include <vector>
 #include <map>
-
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
-#include <boost/foreach.hpp>
+#include <functional>
 
 #include "psd_pvt.h"
 #include "jpeg_memory_src.h"
@@ -91,7 +88,7 @@ private:
     // into ImageSpec
     struct ResourceLoader {
         uint16_t resource_id;
-        boost::function<bool (PSDInput *, uint32_t)> load;
+        std::function<bool (PSDInput *, uint32_t)> load;
     };
 
     // Map image resource ID to image resource block
@@ -196,7 +193,7 @@ private:
     };
 
     std::string m_filename;
-    std::ifstream m_file;
+    OIIO::ifstream m_file;
     //Current subimage
     int m_subimage;
     //Subimage count (1 + layer count)
@@ -389,9 +386,6 @@ private:
         m_file.read ((char *)&buffer, sizeof(buffer));
         if (!bigendian ())
             swap_endian (&buffer);
-
-        // For debugging, numeric_cast will throw if precision is lost:
-        // value = boost::numeric_cast<TVariable>(buffer);
         value = buffer;
         return m_file.good();
     }
@@ -455,7 +449,7 @@ private:
 // 1) Add ADD_LOADER(<ResourceID>) below
 // 2) Add a method in PSDInput:
 //    bool load_resource_<ResourceID> (uint32_t length);
-#define ADD_LOADER(id) {id, boost::bind (&PSDInput::load_resource_##id, _1, _2)}
+#define ADD_LOADER(id) {id, std::bind (&PSDInput::load_resource_##id, std::placeholders::_1, std::placeholders::_2)}
 const PSDInput::ResourceLoader PSDInput::resource_loaders[] =
 {
     ADD_LOADER(1005),
@@ -524,6 +518,8 @@ OIIO_EXPORT ImageInput *psd_input_imageio_create () { return new PSDInput; }
 
 OIIO_EXPORT int psd_imageio_version = OIIO_PLUGIN_VERSION;
 
+OIIO_EXPORT const char* psd_imageio_library_version () { return NULL; }
+
 OIIO_EXPORT const char * psd_input_extensions[] = {
     "psd", "pdd", "psb", NULL
 };
@@ -543,12 +539,14 @@ bool
 PSDInput::open (const std::string &name, ImageSpec &newspec)
 {
     m_filename = name;
+
     Filesystem::open (m_file, name, std::ios::binary);
-    if (!m_file.is_open ()) {
+  
+    if (!m_file) {
         error ("\"%s\": failed to open file", name.c_str());
         return false;
     }
-
+    
     // File Header
     if (!load_header ())
         return false;
@@ -759,7 +757,7 @@ void
 PSDInput::init ()
 {
     m_filename.clear ();
-    m_file.close ();
+    m_file.close();
     m_subimage = -1;
     m_subimage_count = 0;
     m_specs.clear ();
@@ -984,7 +982,7 @@ PSDInput::handle_resources (ImageResourceMap &resources)
 {
     // Loop through each of our resource loaders
     const ImageResourceMap::const_iterator end (resources.end ());
-    BOOST_FOREACH (const ResourceLoader &loader, resource_loaders) {
+    for (const ResourceLoader &loader : resource_loaders) {
         ImageResourceMap::const_iterator it (resources.find (loader.resource_id));
         // If a resource with that ID exists in the file, call the loader
         if (it != end) {
@@ -1532,8 +1530,20 @@ PSDInput::read_rle_lengths (uint32_t height, std::vector<uint32_t> &rle_lengths)
 bool
 PSDInput::load_global_mask_info ()
 {
+    if (!m_layer_mask_info.length)
+        return true;
+
     m_file.seekg (m_layer_mask_info.layer_info.end);
+    uint64_t remaining = m_layer_mask_info.end - m_file.tellg();
     uint32_t length;
+
+    // This section should be at least 17 bytes, but some files lack
+    // global mask info and additional layer info, not convered in the spec
+    if (remaining < 17) {
+        m_file.seekg(m_layer_mask_info.end);
+        return true;
+    }
+
     read_bige<uint32_t> (length);
     std::streampos start = m_file.tellg ();
     std::streampos end = start + (std::streampos)length;
@@ -1559,6 +1569,9 @@ PSDInput::load_global_mask_info ()
 bool
 PSDInput::load_global_additional ()
 {
+    if (!m_layer_mask_info.length)
+        return true;
+
     char signature[4];
     char key[4];
     uint64_t length;
@@ -1568,7 +1581,8 @@ PSDInput::load_global_additional ()
         if (!check_io ())
             return false;
 
-        if (std::memcmp (signature, "8BIM", 4) != 0) {
+        // the spec supports 8BIM, and 8B64 (presumably for psb support)
+        if (std::memcmp (signature, "8BIM", 4) != 0 && std::memcmp (signature, "8B64", 4) != 0) {
             error ("[Global Additional Layer Info] invalid signature");
             return false;
         }
@@ -1593,6 +1607,8 @@ PSDInput::load_global_additional ()
         // skip it for now
         m_file.seekg (length, std::ios::cur);
     }
+    // finished with the layer and mask information section, seek to the end
+    m_file.seekg (m_layer_mask_info.end);
     return check_io ();
 }
 
@@ -1615,7 +1631,7 @@ PSDInput::load_image_data ()
     m_image_data.channel_info.resize (m_header.channel_count);
     // setup some generic properties and read any RLE lengths
     // Image Data Section has RLE lengths for all channels stored first
-    BOOST_FOREACH (ChannelInfo &channel_info, m_image_data.channel_info) {
+    for (ChannelInfo &channel_info : m_image_data.channel_info) {
         channel_info.compression = compression;
         channel_info.channel_id = id++;
         channel_info.data_length = row_length * m_header.height;
@@ -1624,7 +1640,7 @@ PSDInput::load_image_data ()
                 return false;
         }
     }
-    BOOST_FOREACH (ChannelInfo &channel_info, m_image_data.channel_info) {
+    for (ChannelInfo &channel_info : m_image_data.channel_info) {
         channel_info.row_pos.resize (m_header.height);
         channel_info.data_pos = m_file.tellg ();
         channel_info.row_length = (m_header.width * m_header.depth + 7) / 8;
@@ -1677,7 +1693,7 @@ PSDInput::setup ()
     for (int i = 0; i < raw_channel_count; ++i)
         m_channels[0].push_back (&m_image_data.channel_info[i]);
 
-    BOOST_FOREACH (Layer &layer, m_layers) {
+    for (Layer &layer : m_layers) {
         spec_channel_count = m_WantRaw ? mode_channel_count[m_header.color_mode] : 3;
         raw_channel_count = mode_channel_count[m_header.color_mode];
         bool transparency = (bool)layer.channel_id_map.count (ChannelID_Transparency);

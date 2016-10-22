@@ -28,7 +28,7 @@
   (This is the Modified BSD License)
 */
 
-#include <boost/scoped_array.hpp>
+#include <memory>
 
 #include "py_oiio.h"
 #include "OpenImageIO/platform.h"
@@ -306,7 +306,7 @@ ImageBuf_get_pixels (const ImageBuf &buf, TypeDesc format, ROI roi=ROI::All())
     roi.chend = std::min (roi.chend, buf.nchannels()+1);
 
     size_t size = (size_t) roi.npixels() * roi.nchannels() * format.size();
-    boost::scoped_array<char> data (new char [size]);
+    std::unique_ptr<char[]> data (new char [size]);
     if (! buf.get_pixels (roi, format, &data[0])) {
         return object(handle<>(Py_None));
     }
@@ -326,6 +326,23 @@ ImageBuf_get_pixels_bt (const ImageBuf &buf, TypeDesc::BASETYPE format,
 
 BOOST_PYTHON_FUNCTION_OVERLOADS(ImageBuf_get_pixels_bt_overloads,
                                 ImageBuf_get_pixels_bt, 2, 3)
+
+
+
+void
+ImageBuf_set_deep_value (ImageBuf &buf, int x, int y, int z,
+                         int c, int s, float value)
+{
+    buf.set_deep_value (x, y, z, c, s, value);
+}
+
+void
+ImageBuf_set_deep_value_uint (ImageBuf &buf, int x, int y, int z,
+                         int c, int s, uint32_t value)
+{
+    buf.set_deep_value (x, y, z, c, s, value);
+}
+
 
 
 bool
@@ -355,11 +372,14 @@ ImageBuf_set_pixels_array (ImageBuf &buf, ROI roi, numeric::array data)
     size_t size = (size_t) roi.npixels() * roi.nchannels();
     if (size == 0)
         return true;   // done
-    std::vector<float> vals;
-    py_to_stdvector (vals, data);
-    if (size > vals.size())
+
+    TypeDesc type;
+    size_t pylen = 0;
+    const void *addr = python_array_address (data, type, pylen);
+    if (!addr || size > pylen)
         return false;   // Not enough data to fill our ROI
-    buf.set_pixels (roi, TypeDesc::TypeFloat, &vals[0]);
+
+    buf.set_pixels (roi, type, addr);
     return true;
 }
 
@@ -369,6 +389,13 @@ DeepData&
 ImageBuf_deepdataref (ImageBuf *ib)
 {
     return *ib->deepdata();
+}
+
+
+
+static void
+ImageBuf_deep_alloc_dummy ()
+{
 }
 
 
@@ -389,9 +416,13 @@ void declare_imagebuf()
         .def(init<const ImageSpec&>())
 
         .def("clear", &ImageBuf::clear)
-        .def("reset", &ImageBuf_reset_name)
-        .def("reset", &ImageBuf_reset_name2)
-        .def("reset", &ImageBuf_reset_name_config)
+        .def("reset", &ImageBuf_reset_name,
+             (arg("name")))
+        .def("reset", &ImageBuf_reset_name2,
+             (arg("name"), arg("subimage")=0, arg("miplevel")=0))
+        .def("reset", &ImageBuf_reset_name_config,
+             (arg("name"), arg("subimage")=0, arg("miplevel")=0,
+              arg("config")=ImageSpec()))
         .def("reset", &ImageBuf_reset_spec)
         .add_property ("initialized", &ImageBuf::initialized)
         .def("init_spec", &ImageBuf::init_spec)
@@ -453,6 +484,8 @@ void declare_imagebuf()
         .add_property("has_error",   &ImageBuf::has_error)
         .def("geterror",    &ImageBuf::geterror)
 
+        .def("pixelindex", &ImageBuf::pixelindex,
+             (arg("x"), arg("y"), arg("z"), arg("check_range")=false))
         .def("copy_metadata", &ImageBuf::copy_metadata)
         .def("copy_pixels", &ImageBuf::copy_pixels)
         .def("copy",  &ImageBuf_copy,
@@ -486,12 +519,23 @@ void declare_imagebuf()
         .add_property("deep", &ImageBuf::deep)
         .def("deep_samples", &ImageBuf::deep_samples,
              (arg("x"), arg("y"), arg("z")=0))
-        .def("set_deep_samples", &ImageBuf::set_deep_samples)
-        .def("deep_value", &ImageBuf::deep_value)
-        .def("deep_value_uint", &ImageBuf::deep_value_uint)
-        .def("set_deep_value", &ImageBuf::set_deep_value)
-        .def("set_deep_value_uint", &ImageBuf::set_deep_value_uint)
-        .def("deep_alloc", &ImageBuf::deep_alloc)
+        .def("set_deep_samples", &ImageBuf::set_deep_samples,
+             (arg("x"), arg("y"), arg("z")=0, arg("nsamples")=1))
+        .def("deep_insert_samples", &ImageBuf::deep_insert_samples,
+             (arg("x"), arg("y"), arg("z")=0, arg("samplepos"), arg("nsamples")=1))
+        .def("deep_erase_samples", &ImageBuf::deep_erase_samples,
+             (arg("x"), arg("y"), arg("z")=0, arg("samplepos"), arg("nsamples")=1))
+        .def("deep_value", &ImageBuf::deep_value,
+             (arg("x"), arg("y"), arg("z")=0, arg("channel"), arg("sample")))
+        .def("deep_value_uint", &ImageBuf::deep_value_uint,
+             (arg("x"), arg("y"), arg("z")=0, arg("channel"), arg("sample")))
+        .def("set_deep_value", &ImageBuf_set_deep_value,
+             (arg("x"), arg("y"), arg("z")=0, arg("channel"),
+              arg("sample"), arg("value")=0.0f))
+        .def("set_deep_value_uint", &ImageBuf_set_deep_value_uint,
+             (arg("x"), arg("y"), arg("z")=0, arg("channel"),
+              arg("sample"), arg("value")=0))
+        .def("deep_alloc", &ImageBuf_deep_alloc_dummy)  // DEPRECATED(1.7)
         .def("deepdata", &ImageBuf_deepdataref,
              return_value_policy<reference_existing_object>())
 

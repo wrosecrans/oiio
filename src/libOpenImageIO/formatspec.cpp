@@ -33,9 +33,7 @@
 #include <sstream>
 
 #include <OpenEXR/half.h>
-
-#include <boost/tokenizer.hpp>
-#include <boost/foreach.hpp>
+#include <OpenEXR/ImfTimeCode.h>
 
 #include "OpenImageIO/dassert.h"
 #include "OpenImageIO/typedesc.h"
@@ -43,11 +41,14 @@
 #include "OpenImageIO/fmath.h"
 #include "OpenImageIO/imageio.h"
 #include "imageio_pvt.h"
-#include "OpenImageIO/pugixml.hpp"
 
+#if USE_EXTERNAL_PUGIXML
+# include "pugixml.hpp"
+#else
+# include "OpenImageIO/pugixml.hpp"
+#endif
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 // Generate the default quantization parameters, templated on the data
 // type.
@@ -107,7 +108,7 @@ pvt::get_default_quantize (TypeDesc format,
     case TypeDesc::DOUBLE:
         get_default_quantize_ <double> (quant_min, quant_max);
         break;
-    default: ASSERT(0);
+    default: ASSERT_MSG (0, "Unknown data format %d", format.basetype);
     }
 }
 
@@ -121,7 +122,6 @@ ImageSpec::ImageSpec (TypeDesc format)
       nchannels(0), format(format), alpha_channel(-1), z_channel(-1),
       deep(false)
 {
-    set_format (format);
 }
 
 
@@ -134,7 +134,6 @@ ImageSpec::ImageSpec (int xres, int yres, int nchans, TypeDesc format)
       nchannels(nchans), format(format), alpha_channel(-1), z_channel(-1),
       deep(false)
 {
-    set_format (format);
     default_channel_names ();
 }
 
@@ -144,6 +143,7 @@ void
 ImageSpec::set_format (TypeDesc fmt)
 {
     format = fmt;
+    channelformats.clear ();
 }
 
 
@@ -152,37 +152,26 @@ void
 ImageSpec::default_channel_names ()
 {
     channelnames.clear();
+    channelnames.reserve (nchannels);
     alpha_channel = -1;
     z_channel = -1;
-    switch (nchannels) {
-    case 1:
-        channelnames.push_back ("A");
-        break;
-    case 2:
-        channelnames.push_back ("I");
-        channelnames.push_back ("A");
-        alpha_channel = 1;
-        break;
-    case 3:
-        channelnames.push_back ("R");
-        channelnames.push_back ("G");
-        channelnames.push_back ("B");
-        break;
-    default:
-        if (nchannels >= 1)
-            channelnames.push_back ("R");
-        if (nchannels >= 2)
-            channelnames.push_back ("G");
-        if (nchannels >= 3)
-            channelnames.push_back ("B");
-        if (nchannels >= 4) {
-            channelnames.push_back ("A");
-            alpha_channel = 3;
-        }
-        for (int c = 4;  c < nchannels;  ++c)
-            channelnames.push_back (Strutil::format("channel%d", c));
-        break;
+    if (nchannels == 1) {   // Special case: 1-channel is named "Y"
+        channelnames.push_back ("Y");
+        return;
     }
+    // General case: name channels R, G, B, A, channel4, channel5, ...
+    if (nchannels >= 1)
+        channelnames.push_back ("R");
+    if (nchannels >= 2)
+        channelnames.push_back ("G");
+    if (nchannels >= 3)
+        channelnames.push_back ("B");
+    if (nchannels >= 4) {
+        channelnames.push_back ("A");
+        alpha_channel = 3;
+    }
+    for (int c = 4;  c < nchannels;  ++c)
+        channelnames.push_back (Strutil::format("channel%d", c));
 }
 
 
@@ -553,12 +542,13 @@ format_raw_metadata (const ImageIOParameter &p, int maxsize=16)
 {
     std::string out;
     TypeDesc element = p.type().elementtype();
-    int nfull = p.type().numelements() * p.nvalues();
+    int nfull = int(p.type().numelements()) * p.nvalues();
     int n = std::min (nfull, maxsize);
     if (element.basetype == TypeDesc::STRING) {
         for (int i = 0;  i < n;  ++i) {
             const char *s = ((const char **)p.data())[i];
-            out += Strutil::format ("%s\"%s\"", (i ? ", " : ""), s ? s : "");
+            out += Strutil::format ("%s\"%s\"", (i ? ", " : ""),
+                                    s ? Strutil::escape_chars(s) : std::string());
         }
     } else if (element.basetype == TypeDesc::FLOAT) {
         formatType< float >(p, n, element, "%s%g", out);
@@ -854,6 +844,11 @@ ImageSpec::metadata_val (const ImageIOParameter &p, bool human)
                 break;
             }
         }
+        if (p.type() == TypeDesc::TypeTimeCode) {
+            Imf::TimeCode tc = *reinterpret_cast<const Imf::TimeCode *>(p.data());
+            nice = Strutil::format ("%02d:%02d:%02d:%02d", tc.hours(),
+                                    tc.minutes(), tc.seconds(), tc.frame());
+        }
         if (nice.length())
             out = out + " (" + nice + ")";
     }
@@ -867,22 +862,23 @@ namespace { // Helper functions for from_xml () and to_xml () methods.
 
 using namespace pugi;
 
-static void
-add_node (xml_node &node, const std::string &node_name, const char *val)
+static xml_node
+add_node (xml_node &node, string_view node_name, const char *val)
 {
     xml_node newnode = node.append_child();
     newnode.set_name (node_name.c_str ());
     newnode.append_child (node_pcdata).set_value (val);
+    return newnode;
 }
 
 
 
-static void
-add_node (xml_node &node, const std::string &node_name, const int val)
+static xml_node
+add_node (xml_node &node, string_view node_name, const int val)
 {
     char buf[64];
     sprintf (buf, "%d", val);
-    add_node (node, node_name, buf);
+    return add_node (node, node_name, buf);
 }
 
 
@@ -892,9 +888,8 @@ add_channelnames_node (xml_document &doc, const std::vector<std::string> &channe
 {
     xml_node channel_node = doc.child ("ImageSpec").append_child();
     channel_node.set_name ("channelnames");
-    BOOST_FOREACH (std::string name, channelnames) {
+    for (auto&& name : channelnames)
         add_node (channel_node, "channelname", name.c_str ());
-    }
 }
 
 
@@ -914,8 +909,43 @@ get_channelnames (const xml_node &n, std::vector<std::string> &channelnames)
 
 
 
-std::string
-ImageSpec::to_xml () const
+static const char *
+extended_format_name (TypeDesc type, int bits)
+{
+    if (bits && bits < (int)type.size()*8) {
+        // The "oiio:BitsPerSample" betrays a different bit depth in the
+        // file than the data type we are passing.
+        if (type == TypeDesc::UINT8 || type == TypeDesc::UINT16 ||
+            type == TypeDesc::UINT32 || type == TypeDesc::UINT64)
+            return ustring::format("uint%d", bits).c_str();
+        if (type == TypeDesc::INT8 || type == TypeDesc::INT16 ||
+            type == TypeDesc::INT32 || type == TypeDesc::INT64)
+            return ustring::format("int%d", bits).c_str();
+    }
+    return type.c_str();  // use the name implied by type
+}
+
+
+
+inline std::string
+format_res (const ImageSpec &spec, int w, int h, int d)
+{
+    using Strutil::format;
+    return (spec.depth > 1) ? format("%d x %d x %d", w, h, d) : format("%d x %d", w, h);
+}
+
+
+inline std::string
+format_offset (const ImageSpec &spec, int x, int y, int z)
+{
+    using Strutil::format;
+    return (spec.depth > 1) ? format("%d, %d, %d", x, y, z) : format("%d, %d", x, y);
+}
+
+
+
+static std::string
+spec_to_xml (const ImageSpec &spec, ImageSpec::SerialVerbose verbose)
 {
     xml_document doc;
 
@@ -923,33 +953,141 @@ ImageSpec::to_xml () const
     doc.child ("ImageSpec").append_attribute ("version") = OIIO_PLUGIN_VERSION;
     xml_node node = doc.child ("ImageSpec");
 
-    add_node (node, "x", x);
-    add_node (node, "y", y);
-    add_node (node, "z", z);
-    add_node (node, "width", width);
-    add_node (node, "height", height);
-    add_node (node, "depth", depth);
-    add_node (node, "full_x", full_x);
-    add_node (node, "full_y", full_y);
-    add_node (node, "full_z", full_z);
-    add_node (node, "full_width", full_width);
-    add_node (node, "full_height", full_height);
-    add_node (node, "full_depth", full_depth);
-    add_node (node, "tile_width", tile_width);
-    add_node (node, "tile_height", tile_height);
-    add_node (node, "tile_depth", tile_depth);
-    add_node (node, "format", format.c_str ());
-    add_node (node, "nchannels", nchannels);
-    add_channelnames_node (doc, channelnames);
-    add_node (node, "alpha_channel", alpha_channel);
-    add_node (node, "z_channel", z_channel);
-    add_node (node, "deep", int(deep));
-    
-    // FIXME: What about extra attributes?
-    
+    add_node (node, "x", spec.x);
+    add_node (node, "y", spec.y);
+    add_node (node, "z", spec.z);
+    add_node (node, "width", spec.width);
+    add_node (node, "height", spec.height);
+    add_node (node, "depth", spec.depth);
+    add_node (node, "full_x", spec.full_x);
+    add_node (node, "full_y", spec.full_y);
+    add_node (node, "full_z", spec.full_z);
+    add_node (node, "full_width", spec.full_width);
+    add_node (node, "full_height", spec.full_height);
+    add_node (node, "full_depth", spec.full_depth);
+    add_node (node, "tile_width", spec.tile_width);
+    add_node (node, "tile_height", spec.tile_height);
+    add_node (node, "tile_depth", spec.tile_depth);
+    add_node (node, "format", spec.format.c_str ());
+    add_node (node, "nchannels", spec.nchannels);
+    add_channelnames_node (doc, spec.channelnames);
+    add_node (node, "alpha_channel", spec.alpha_channel);
+    add_node (node, "z_channel", spec.z_channel);
+    add_node (node, "deep", int(spec.deep));
+
+    if (verbose > ImageSpec::SerialBrief) {
+        for (auto&& p : spec.extra_attribs) {
+            std::string s = spec.metadata_val (p, false);  // raw data
+            if (s == "1.#INF")
+                s ="inf";
+            if (p.type() == TypeDesc::STRING) {
+                if (s.size() >= 2 && s[0] == '\"' && s[s.size()-1] == '\"')
+                    s = s.substr (1, s.size()-2);
+            }
+            std::string desc;
+            for (int e = 0;  explanation[e].oiioname;  ++e) {
+                if (! strcmp (explanation[e].oiioname, p.name().c_str()) &&
+                    explanation[e].explainer) {
+                    desc = explanation[e].explainer (p, explanation[e].extradata);
+                    break;
+                }
+            }
+            if (p.type() == TypeDesc::TypeTimeCode) {
+                Imf::TimeCode tc = *reinterpret_cast<const Imf::TimeCode *>(p.data());
+                desc = Strutil::format ("%02d:%02d:%02d:%02d", tc.hours(),
+                                        tc.minutes(), tc.seconds(), tc.frame());
+            }
+            xml_node n = add_node (node, "attrib", s.c_str());
+            n.append_attribute("name").set_value (p.name().c_str());
+            n.append_attribute("type").set_value (p.type().c_str());
+            if (! desc.empty())
+                n.append_attribute("description").set_value (desc.c_str());
+        }
+    }
+
     std::ostringstream result;
     doc.print (result, "");
     return result.str();
+}
+
+
+
+
+std::string
+ImageSpec::serialize (SerialFormat fmt, SerialVerbose verbose) const
+{
+    if (fmt == SerialXML)
+        return spec_to_xml (*this, verbose);
+
+    // Text case:
+    //
+
+    using Strutil::format;
+    std::stringstream out;
+
+    out << ((depth > 1) ? format("%4d x %4d x %4d", width, height, depth)
+                        : format("%4d x %4d", width, height));
+    out << format (", %d channel, %s%s", nchannels,
+                   deep ? "deep " : "", depth > 1 ? "volume " : "");
+    if (channelformats.size()) {
+        for (size_t c = 0;  c < channelformats.size();  ++c)
+            out << format ("%s%s", c ? "/" : "", channelformats[c]);
+    } else {
+        int bits = get_int_attribute ("oiio:BitsPerSample", 0);
+        out << extended_format_name (this->format, bits);
+    }
+    out << '\n';
+
+    if (verbose >= SerialDetailed) {
+        out << format ("    channel list: ");
+        for (int i = 0;  i < nchannels;  ++i) {
+            if (i < (int)channelnames.size())
+                out << channelnames[i];
+            else
+                out << "unknown";
+            if (i < (int)channelformats.size())
+                out << format (" (%s)", channelformats[i]);
+            if (i < nchannels-1)
+                out << ", ";
+        }
+        out << '\n';
+        if (x || y || z) {
+            out << "    pixel data origin: "
+                << ((depth > 1) ? format("x=%d, y=%d, z=%d", x, y, z)
+                                : format("x=%d, y=%d", x, y)) << '\n';
+        }
+        if (full_x || full_y || full_z ||
+              (full_width != width && full_width != 0) ||
+              (full_height != height && full_height != 0) ||
+              (full_depth != depth && full_depth != 0)) {
+            out << "    full/display size: "
+                << format_res (*this, full_width, full_height, full_depth) << '\n';
+            out << "    full/display origin: "
+                << format_offset (*this, full_x, full_y, full_z) << '\n';
+        }
+        if (tile_width) {
+            out << "    tile size: "
+                << format_res (*this, tile_width, tile_height, tile_depth) << '\n';
+        }
+
+        for (auto&& p : extra_attribs) {
+            out << format ("    %s: ", p.name());
+            std::string s = metadata_val (p, verbose == SerialDetailedHuman);
+            if (s == "1.#INF")
+                s ="inf";
+            out << s << '\n';
+        }
+    }
+
+    return out.str();
+}
+
+
+
+std::string
+ImageSpec::to_xml () const
+{
+    return spec_to_xml (*this, SerialDetailedHuman);
 }
 
 
@@ -992,6 +1130,4 @@ ImageSpec::from_xml (const char *xml)
 }
 
 
-}
-OIIO_NAMESPACE_EXIT
-
+OIIO_NAMESPACE_END

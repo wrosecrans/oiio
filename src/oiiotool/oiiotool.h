@@ -34,15 +34,30 @@
 #include "OpenImageIO/imagebuf.h"
 #include "OpenImageIO/refcnt.h"
 #include "OpenImageIO/timer.h"
+#include "OpenImageIO/sysutil.h"
 
 
-OIIO_NAMESPACE_ENTER {
+OIIO_NAMESPACE_BEGIN
 namespace OiioTool {
 
 typedef int (*CallbackFunction)(int argc,const char*argv[]);
 
 class ImageRec;
 typedef shared_ptr<ImageRec> ImageRecRef;
+
+
+/// Polycy hints for reading images
+enum ReadPolicy {
+    ReadDefault = 0,       //< Default: use cache, maybe convert to float.
+                           //<   For "small" files, may bypass cache.
+    ReadNative  = 1,       //< Keep in native type, use cache if it supports
+                           //<   the native type, bypass if not. May still
+                           //<   bypass cache for "small" images.
+    ReadNoCache = 2,       //< Bypass the cache regardless of size (beware!),
+                           //<   but still subject to format conversion.
+    ReadNativeNoCache = 3, //< No cache, no conversion. Do it all now.
+                           //<   You better know what you're doing.
+};
 
 
 
@@ -64,9 +79,15 @@ public:
     bool autoorient;
     bool autocc;                      // automatically color correct
     bool nativeread;                  // force native data type reads
+    int cachesize;
+    int autotile;
     std::string full_command_line;
     std::string printinfo_metamatch;
     std::string printinfo_nometamatch;
+    std::string printinfo_format;
+    bool printinfo_verbose;
+    ImageSpec input_config;           // configuration options for reading
+    bool input_config_set;
 
     // Output options
     TypeDesc output_dataformat;
@@ -105,6 +126,9 @@ public:
     typedef std::map<std::string, double> TimingMap;
     TimingMap function_times;
     bool enable_function_timing;
+    size_t peak_memory;
+    int num_outputs;                         // Count of outputs written
+    bool printed_info;                       // printed info at some point
 
     Oiiotool ();
 
@@ -113,11 +137,11 @@ public:
     /// Force img to be read at this point.  Use this wrapper, don't directly
     /// call img->read(), because there's extra work done here specific to
     /// oiiotool.
-    bool read (ImageRecRef img);
+    bool read (ImageRecRef img, ReadPolicy readpolicy = ReadDefault);
     // Read the current image
-    bool read () {
+    bool read (ReadPolicy readpolicy = ReadDefault) {
         if (curimg)
-            return read (curimg);
+            return read (curimg, readpolicy);
         return true;
     }
 
@@ -158,6 +182,14 @@ public:
 
     ImageRecRef top () { return curimg; }
 
+    // How many images are on the stack?
+    int image_stack_depth () const {
+        return curimg ? 1+int(image_stack.size()) : 0;
+    }
+
+    // Parse geom in the form of "x,y" to retrieve a 2D integer position.
+    bool get_position (string_view command, string_view geom, int &x, int &y);
+
     // Modify the resolution and/or offset according to what's in geom.
     // Valid geometries are WxH (resolution), +X+Y (offsets), WxH+X+Y
     // (resolution and offset).  If 'allow_scaling' is true, geometries of
@@ -185,6 +217,12 @@ public:
 
     void error (string_view command, string_view explanation="");
     void warning (string_view command, string_view explanation="");
+
+    size_t check_peak_memory () {
+        size_t mem = Sysutil::memory_used();
+        peak_memory = std::max (peak_memory, mem);
+        return mem;
+    }
 
 private:
     CallbackFunction m_pending_callback;
@@ -312,7 +350,7 @@ public:
     // it's lazily kept as name only, without reading the file.)
     bool elaborated () const { return m_elaborated; }
 
-    bool read (bool force_native_read=false);
+    bool read (ReadPolicy readpolicy = ReadDefault);
 
     // ir(subimg,mip) references a specific MIP level of a subimage
     // ir(subimg) references the first MIP level of a subimage
@@ -331,10 +369,20 @@ public:
         return subimg < subimages() ? m_subimages[subimg].spec(mip) : NULL;
     }
 
+    bool was_output () const { return m_was_output; }
+    void was_output (bool val) { m_was_output = val; }
     bool metadata_modified () const { return m_metadata_modified; }
-    void metadata_modified (bool mod) { m_metadata_modified = mod; }
+    void metadata_modified (bool mod) {
+        m_metadata_modified = mod;
+        if (mod)
+            was_output(false);
+    }
     bool pixels_modified () const { return m_pixels_modified; }
-    void pixels_modified (bool mod) { m_pixels_modified = mod; }
+    void pixels_modified (bool mod) {
+        m_pixels_modified = mod;
+        if (mod)
+            was_output(false);
+    }
 
     std::time_t time() const { return m_time; }
 
@@ -343,7 +391,7 @@ public:
     // update the outer copy held by the SubimageRec.
     void update_spec_from_imagebuf (int subimg=0, int mip=0) {
         *m_subimages[subimg].spec(mip) = m_subimages[subimg][mip]->spec();
-        metadata_modified();
+        metadata_modified (true);
     }
 
     /// Error reporting for ImageRec: call this with printf-like arguments.
@@ -366,6 +414,7 @@ private:
     bool m_elaborated;
     bool m_metadata_modified;
     bool m_pixels_modified;
+    bool m_was_output;
     std::vector<SubimageRec> m_subimages;
     std::time_t m_time;  //< Modification time of the input file
     ImageCache *m_imagecache;
@@ -390,6 +439,7 @@ struct print_info_options {
     bool dumpdata_showempty;
     std::string metamatch;
     std::string nometamatch;
+    std::string infoformat;
     size_t namefieldlength;
 
     print_info_options ()
@@ -414,9 +464,11 @@ bool print_info (Oiiotool &ot, const std::string &filename,
 // TypeDesc::INT (decode the value as an int), FLOAT, STRING, or UNKNOWN
 // (look at the string and try to discern whether it's an int, float, or
 // string).  If the 'value' string is empty, it will delete the
-// attribute.
+// attribute.  If allsubimages is true, apply the attribute to all
+// subimages, otherwise just the first subimage.
 bool set_attribute (ImageRecRef img, string_view attribname,
-                    TypeDesc type, string_view value);
+                    TypeDesc type, string_view value,
+                    bool allsubimages);
 
 inline bool same_size (const ImageBuf &A, const ImageBuf &B)
 {
@@ -505,6 +557,12 @@ public:
             std::cout << "\n";
         }
 
+        // Parse the options.
+        options.clear ();
+        options["allsubimages"] = ot.allsubimages;
+        option_defaults ();  // this can be customized to set up defaults
+        ot.extract_options (options, args[0]);
+
         // Read all input images, and reserve (and push) the output image.
         int subimages = compute_subimages();
         if (nimages()) {
@@ -515,11 +573,6 @@ public:
             ir[0].reset (new ImageRec (opname(), subimages));
             ot.push (ir[0]);
         }
-
-        // Parse the options.
-        options.clear ();
-        option_defaults ();  // this can be customized to set up defaults
-        ot.extract_options (options, args[0]);
 
         // Give a chance for customization before we walk the subimages.
         // If the setup method returns false, we're done.
@@ -532,7 +585,7 @@ public:
             // Get pointers for the ImageBufs for this subimage
             img.resize (nimages());
             for (int i = 0; i < nimages(); ++i)
-                img[i] = &((*ir[i])(std::min (s, ir[i]->subimages())));
+                img[i] = &((*ir[i])(std::min (s, ir[i]->subimages()-1)));
 
             // Call the impl kernel for this subimage
             bool ok = impl (nimages() ? &img[0] : NULL);
@@ -540,6 +593,15 @@ public:
                 ot.error (opname(), img[0]->geterror());
             ir[0]->update_spec_from_imagebuf (s);
         }
+
+        // Make sure to forward any errors missed by the impl
+        for (int i = 0; i < nimages(); ++i) {
+            if (img[i]->has_error())
+                ot.error (opname(), img[i]->geterror());
+        }
+
+        if (ot.debug || ot.runstats)
+            ot.check_peak_memory();
 
         // Optional cleanup after processing all the subimages
         cleanup ();
@@ -565,10 +627,13 @@ public:
     // to defaults. This will be called separate
     virtual void option_defaults () { }
 
-    // By default, we make the results have the same number of subimages as
-    // the first input image. Override this is you want another behavior.
+    // Default subimage logic: if the global -a flag was set or if this command
+    // had ":allsubimages=1" option set, then apply the command to all subimages
+    // (of the first input image). Otherwise, we'll only apply the command to
+    // the first subimage. Override this is you want another behavior.
     virtual int compute_subimages () {
-        return ot.allsubimages ? (nimages() > 1 ? ir[1]->subimages() : 1) : 1;
+        int all_subimages = Strutil::from_string<int>(options["allsubimages"]);
+        return all_subimages ? (nimages() > 1 ? ir[1]->subimages() : 1) : 1;
     }
 
     int nargs () const { return m_nargs; }
@@ -645,7 +710,7 @@ protected:
 
 
 } // OiioTool namespace
-} OIIO_NAMESPACE_EXIT;
+OIIO_NAMESPACE_END;
 
 
 #endif // OIIOTOOL_H

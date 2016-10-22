@@ -46,16 +46,15 @@
 
 #include <vector>
 
-// This needs to be included before GL.h
 #include <glew.h>
-
-#include <QtGui/QAction>
-#include <QtGui/QCheckBox>
-#include <QtGui/QDialog>
-#include <QtGui/QMainWindow>
+#include <QGLWidget>
+#include <QAction>
+#include <QCheckBox>
+#include <QDialog>
+#include <QMainWindow>
 
 #ifndef QT_NO_PRINTER
-#include <QtGui/QPrinter>
+// #include <QPrinter>
 #endif
 
 #include "OpenImageIO/imageio.h"
@@ -133,13 +132,11 @@ public:
     /// color space correction when indicated.
     void pixel_transform (bool srgb_to_linear, int color_mode, int channel);
 
-    bool get_pixels (int xbegin, int xend, int ybegin, int yend,
-                     TypeDesc format, void *result) {
-        if (m_corrected_image.localpixels ()) {
-            return m_corrected_image.get_pixels (xbegin, xend, ybegin, yend,
-                                                  0, 1, format, result);
-        }
-        return ImageBuf::get_pixels (xbegin, xend, ybegin, yend, 0, 1, format, result);
+    bool get_pixels (ROI roi, TypeDesc format, void *result) {
+        if (m_corrected_image.localpixels ())
+            return m_corrected_image.get_pixels (roi, format, result);
+        else
+            return ImageBuf::get_pixels (roi, format, result);
     }
 
     bool auto_subimage (void) const { return m_auto_subimage; }
@@ -335,7 +332,7 @@ private:
     IvPreferenceWindow *preferenceWindow;
 
 #ifndef QT_NO_PRINTER
-    QPrinter printer;
+    // QPrinter printer;
 #endif
 
     QAction *openAct, *reloadAct, *closeImgAct;
